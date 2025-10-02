@@ -129,6 +129,18 @@ class LorTaConfig(PeftConfig):
     )
     lora_alpha: int = field(default=8, metadata={"help": "Lora alpha"})
     init_scale: float = field(default=0.0, metadata={"help": "Initial scale for LoRTA"})
+    use_preconditioner: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to apply analytic preconditioners to the shared LoRTA factors during optimization.",
+        },
+    )
+    preconditioner_epsilon: float = field(
+        default=1e-6,
+        metadata={
+            "help": "Diagonal jitter added before inverting preconditioner matrices to ensure numerical stability.",
+        },
+    )
     lora_dropout: float = field(default=0.0, metadata={"help": "Lora dropout"})
     fan_in_fan_out: bool = field(
         default=False,

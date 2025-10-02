@@ -21,7 +21,7 @@ from dataclasses import asdict
 from enum import Enum
 from functools import partial
 from itertools import chain
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 import torch
 from torch import nn
@@ -131,8 +131,13 @@ class LorTaModel(BaseTuner):
     prefix: str = "lora_"
 
     def __init__(self, model, config, adapter_name) -> None:
+        # NOTE: BaseTuner.__init__ calls `inject_adapter` which relies on the
+        # `_preconditioner_handles` container being present. Initialise it
+        # up-front so that hook setup during adapter injection is safe even on
+        # repeated adapter loads.
+        self._preconditioner_handles = {}
         super().__init__(model, config, adapter_name)
-
+        
     def _map_layer_to_adapter(self, layer_idx: int, target_matrix: str) -> str:
         return ".".join([self.target_names_prefix, f"{layer_idx}", self.qkvo_mapping[target_matrix]])
 
@@ -318,12 +323,39 @@ class LorTaModel(BaseTuner):
                     nn.init.kaiming_uniform_(self.model.lora_A[i, j], a=math.sqrt(5))
 
         self._mark_only_adapters_as_trainable(model)
+        self._setup_preconditioner_hooks()
 
     def weights_pre_forward_hook(self, target, args, kwargs, module_name):
         # pre-forward hook to inject weights
         # print(self.tensor_weights.keys())
         kwargs["adapter_weight"] = self.tensor_weights[module_name]
         return args, kwargs
+
+    def _remove_preconditioner_hooks(self):
+        handles = getattr(self, "_preconditioner_handles", None)
+        if not handles:
+            return
+
+        for module_handles in handles.values():
+            for handle in module_handles:
+                handle.remove()
+
+        handles.clear()
+
+    def _setup_preconditioner_hooks(self):
+        handles = getattr(self, "_preconditioner_handles", None)
+        if handles is None:
+            self._preconditioner_handles = {}
+            handles = self._preconditioner_handles
+
+        # Ensure we do not leak handles when loading adapters repeatedly.
+        self._remove_preconditioner_hooks()
+
+        for name, module in self.model.named_modules():
+            if isinstance(module, (LorTaLayer, LorTaLinear)):
+                pre_forward = partial(self.weights_pre_forward_hook, module_name=name)
+                handle = module.register_forward_pre_hook(pre_forward, with_kwargs=True)
+                handles.setdefault(name, []).append(handle)
 
     def _check_new_adapter_config(self, config: LorTaConfig) -> None:
         """
@@ -482,7 +514,269 @@ class LorTaModel(BaseTuner):
                         m.bias.requires_grad = True
             else:
                 raise NotImplementedError(f"Requested bias: {bias}, is not implemented.")
+    
+    def _get_preconditioner_config(self) -> Optional[LorTaConfig]:
+        for adapter_name, config in self.peft_config.items():
+            if getattr(config, "use_preconditioner", False):
+                return config
+        return None
+    
+    def _setup_preconditioner_hooks(self) -> None:
+        config = self._get_preconditioner_config()
+        if config is None:
+            return
+        epsilon = float(getattr(config, "preconditioner_epsilon", 1e-6))
 
+        if "lora_A" not in self._preconditioner_handles:
+            def _hook_A(grad: torch.Tensor) -> torch.Tensor:
+                return self._apply_A_preconditioner(grad, epsilon)
+
+            handle_A = self.model.lora_A.register_hook(_hook_A)
+            self._preconditioner_handles["lora_A"] = handle_A
+
+        if "lora_B" not in self._preconditioner_handles:
+            def _hook_B(grad: torch.Tensor) -> torch.Tensor:
+                return self._apply_B_preconditioner(grad, epsilon)
+
+            handle_B = self.model.lora_B.register_hook(_hook_B)
+            self._preconditioner_handles["lora_B"] = handle_B
+
+        if "lora_C_h" not in self._preconditioner_handles:
+            def _hook_C_h(grad: torch.Tensor) -> torch.Tensor:
+                return self._apply_C_h_preconditioner(grad, epsilon)
+
+            handle_C_h = self.model.lora_C_h.register_hook(_hook_C_h)
+            self._preconditioner_handles["lora_C_h"] = handle_C_h
+
+        if "lora_C_l" not in self._preconditioner_handles:
+            def _hook_C_l(grad: torch.Tensor) -> torch.Tensor:
+                return self._apply_C_l_preconditioner(grad, epsilon)
+
+            handle_C_l = self.model.lora_C_l.register_hook(_hook_C_l)
+            self._preconditioner_handles["lora_C_l"] = handle_C_l
+
+        if "lora_C_m" not in self._preconditioner_handles:
+            def _hook_C_m(grad: torch.Tensor) -> torch.Tensor:
+                return self._apply_C_m_preconditioner(grad, epsilon)
+
+            handle_C_m = self.model.lora_C_m.register_hook(_hook_C_m)
+            self._preconditioner_handles["lora_C_m"] = handle_C_m
+
+    def _apply_A_preconditioner(self, grad: Optional[torch.Tensor], epsilon: float) -> Optional[torch.Tensor]:
+        if grad is None:
+            return grad
+
+        preconditioner = self._compute_A_preconditioner_matrix(epsilon)
+        preconditioner = preconditioner.to(device=grad.device, dtype=grad.dtype)
+        return grad @ preconditioner
+    
+    def _apply_B_preconditioner(self, grad: Optional[torch.Tensor], epsilon: float) -> Optional[torch.Tensor]:
+        if grad is None:
+            return grad
+
+        preconditioner = self._compute_B_preconditioner_matrix(epsilon)
+        preconditioner = preconditioner.to(device=grad.device, dtype=grad.dtype)
+        return preconditioner @ grad
+    
+    def _apply_C_h_preconditioner(self, grad: Optional[torch.Tensor], epsilon: float) -> Optional[torch.Tensor]:
+        if grad is None:
+            return grad
+
+        preconditioner = self._compute_C_h_preconditioner_matrix(epsilon)
+        preconditioner = preconditioner.to(device=grad.device, dtype=grad.dtype)
+        return grad @ preconditioner
+    
+    def _apply_C_l_preconditioner(self, grad: Optional[torch.Tensor], epsilon: float) -> Optional[torch.Tensor]:
+        if grad is None:
+            return grad
+
+        preconditioner = self._compute_C_l_preconditioner_matrix(epsilon)
+        preconditioner = preconditioner.to(device=grad.device, dtype=grad.dtype)
+        return grad @ preconditioner
+    
+    def _apply_C_m_preconditioner(self, grad: Optional[torch.Tensor], epsilon: float) -> Optional[torch.Tensor]:
+        if grad is None:
+            return grad
+
+        preconditioner = self._compute_C_m_preconditioner_matrix(epsilon)
+        preconditioner = preconditioner.to(device=grad.device, dtype=grad.dtype)
+        return grad @ preconditioner
+
+    def _compute_A_preconditioner_matrix(self, epsilon: float) -> torch.Tensor:
+        with torch.no_grad():
+            B = self.model.lora_B.detach()
+            C_l = self.model.lora_C_l.detach()
+            C_h = self.model.lora_C_h.detach()
+            C_m = self.model.lora_C_m.detach()
+
+            dtype = B.dtype
+            device = B.device
+
+            BBT = B @ B.transpose(0, 1)
+
+            # Build every combination of diagonal factors so we can accumulate the
+            # Σ_{h,l,m} diag(C_h[h]) diag(C_l[l]) diag(C_m[m]) B Bᵀ diag(C_m[m]) diag(C_l[l]) diag(C_h[h])
+            # term exactly as derived.
+            preconditioner_matrix = torch.zeros_like(BBT, device=device, dtype=dtype)
+
+            for l in range(C_l.size(0)):
+                for h in range(C_h.size(0)):
+                    for m in range(C_m.size(0)):
+                        d = C_h[h] * C_l[l] * C_m[m]
+                        D = torch.diag(d)
+                        preconditioner_matrix += D @ BBT @ D.T
+
+            identity = torch.eye(preconditioner_matrix.size(0), device=device, dtype=dtype) * epsilon
+            stabilized = preconditioner_matrix + identity
+
+            try:
+                preconditioner = torch.linalg.inv(stabilized)
+            except RuntimeError:
+                preconditioner = torch.linalg.pinv(stabilized)
+
+            if not torch.isfinite(preconditioner).all():
+                preconditioner = torch.linalg.pinv(stabilized)
+
+            return preconditioner
+
+    def _compute_B_preconditioner_matrix(self, epsilon: float) -> torch.Tensor:
+        with torch.no_grad():
+            A = self.model.lora_A.detach()
+            C_l = self.model.lora_C_l.detach()
+            C_h = self.model.lora_C_h.detach()
+            C_m = self.model.lora_C_m.detach()
+
+            dtype = A.dtype
+            device = A.device
+
+            ATA = A.transpose(0, 1) @ A
+
+            preconditioner_matrix = torch.zeros_like(ATA, device=device, dtype=dtype)
+
+            for l in range(C_l.size(0)):
+                for h in range(C_h.size(0)):
+                    for m in range(C_m.size(0)):
+                        d = C_h[h] * C_l[l] * C_m[m]
+                        D = torch.diag(d)
+                        preconditioner_matrix += D.transpose(0, 1) @ ATA @ D
+
+            identity = torch.eye(preconditioner_matrix.size(0), device=device, dtype=dtype) * epsilon
+            stabilized = preconditioner_matrix + identity
+
+            try:
+                preconditioner = torch.linalg.inv(stabilized)
+            except RuntimeError:
+                preconditioner = torch.linalg.pinv(stabilized)
+
+            if not torch.isfinite(preconditioner).all():
+                preconditioner = torch.linalg.pinv(stabilized)
+
+            return preconditioner  
+        
+    def _compute_C_h_preconditioner_matrix(self, epsilon: float) -> torch.Tensor:
+        with torch.no_grad():
+            A = self.model.lora_A.detach()
+            B = self.model.lora_B.detach()
+            C_l = self.model.lora_C_l.detach()
+            C_m = self.model.lora_C_m.detach()
+
+            dtype = A.dtype
+            device = A.device
+
+            ATA = A.transpose(0, 1) @ A
+            BBT = B @ B.transpose(0, 1)
+
+            preconditioner_matrix = torch.zeros_like(ATA, device=device, dtype=dtype)
+
+            for l in range(C_l.size(0)):
+                for m in range(C_m.size(0)):
+                    d = C_l[l] * C_m[m]
+                    D = torch.diag(d)
+                    preconditioner_matrix += ATA * (D @ BBT @ D.transpose(0, 1))
+
+            identity = torch.eye(preconditioner_matrix.size(0), device=device, dtype=dtype) * epsilon
+            stabilized = preconditioner_matrix + identity
+
+            try:
+                preconditioner = torch.linalg.inv(stabilized)
+            except RuntimeError:
+                preconditioner = torch.linalg.pinv(stabilized)
+
+            if not torch.isfinite(preconditioner).all():
+                preconditioner = torch.linalg.pinv(stabilized)
+
+            return preconditioner.transpose(0,1)
+        
+    def _compute_C_l_preconditioner_matrix(self, epsilon: float) -> torch.Tensor:
+        with torch.no_grad():
+            A = self.model.lora_A.detach()
+            B = self.model.lora_B.detach()
+            C_h = self.model.lora_C_h.detach()
+            C_m = self.model.lora_C_m.detach()
+
+            dtype = A.dtype
+            device = A.device
+
+            ATA = A.transpose(0, 1) @ A
+            BBT = B @ B.transpose(0, 1)
+
+            preconditioner_matrix = torch.zeros_like(ATA, device=device, dtype=dtype)
+
+            for h in range(C_h.size(0)):
+                for m in range(C_m.size(0)):
+                    d = C_h[h] * C_m[m]
+                    D = torch.diag(d)
+                    preconditioner_matrix += (D.transpose(0, 1) @ ATA @ D) * BBT
+
+            identity = torch.eye(preconditioner_matrix.size(0), device=device, dtype=dtype) * epsilon
+            stabilized = preconditioner_matrix + identity
+
+            try:
+                preconditioner = torch.linalg.inv(stabilized)
+            except RuntimeError:
+                preconditioner = torch.linalg.pinv(stabilized)
+
+            if not torch.isfinite(preconditioner).all():
+                preconditioner = torch.linalg.pinv(stabilized)
+
+            return preconditioner.transpose(0, 1)
+        
+    def _compute_C_m_preconditioner_matrix(self, epsilon: float) -> torch.Tensor:
+        with torch.no_grad():
+            A = self.model.lora_A.detach()
+            B = self.model.lora_B.detach()
+            C_l = self.model.lora_C_l.detach()
+            C_h = self.model.lora_C_h.detach()
+
+            dtype = A.dtype
+            device = A.device
+
+            ATA = A.transpose(0, 1) @ A
+            BBT = B @ B.transpose(0, 1)
+
+            preconditioner_matrix = torch.zeros_like(ATA, device=device, dtype=dtype)
+
+            for l in range(C_l.size(0)):
+                D1 = torch.diag(C_l[l])
+                for h in range(C_h.size(0)):
+                    D2 = torch.diag(C_h[h])
+                    left = D2.transpose(0, 1) @ ATA @ D2
+                    right = D1 @ BBT @ D1.transpose(0, 1)
+                    preconditioner_matrix += left * right
+
+            identity = torch.eye(preconditioner_matrix.size(0), device=device, dtype=dtype) * epsilon
+            stabilized = preconditioner_matrix + identity
+
+            try:
+                preconditioner = torch.linalg.inv(stabilized)
+            except RuntimeError:
+                preconditioner = torch.linalg.pinv(stabilized)
+
+            if not torch.isfinite(preconditioner).all():
+                preconditioner = torch.linalg.pinv(stabilized)
+
+            return preconditioner.transpose(0, 1)
+    
     @staticmethod
     def _create_new_module(lora_config, adapter_name, target, **kwargs):
         # Collect dispatcher functions to decide what backend to use for the replaced LoRA layer. The order matters,
@@ -659,6 +953,7 @@ class LorTaModel(BaseTuner):
         Returns:
             `torch.nn.Module`: The merged model.
         """
+        self._remove_preconditioner_hooks()
         self._check_merge_allowed()
 
         if adapter_names is None:

@@ -30,7 +30,8 @@ import torch
 import torch.nn as nn
 import transformers
 import wandb
-from datasets import load_dataset, load_metric
+from datasets import load_dataset
+from evaluate import load as load_metric
 from transformers import (
     AutoConfig,
     AutoModelForSequenceClassification,
@@ -316,6 +317,16 @@ class ModelArguments:
     custom_scaling: Optional[int] = field(
         default=0,
     )
+    use_preconditioner: bool = field(
+        default=False,
+        metadata={"help": "Enable analytic preconditioners for LoRTA adapters."},
+    )
+    preconditioner_epsilon: float = field(
+        default=1e-6,
+        metadata={
+            "help": "Stabilization term added to the LoRTA preconditioner before inversion.",
+        },
+    )
     lora_alpha: Optional[float] = field(
         default=1.0,
         metadata={"help": "LoRA alpha"},
@@ -375,8 +386,8 @@ class CustomTrainer(Trainer):
         self.classifier_wd = classifier_wd
         self.classifier_lr = classifier_lr
 
-    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
-        result = super().training_step(model, inputs)
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], num_items_in_batch: int= None) -> torch.Tensor:
+        result = super().training_step(model, inputs, num_items_in_batch)
         self.gradientLogger.log(self.state)
         return result
 
@@ -673,6 +684,8 @@ def main():
         bias="none",
         modules_to_save=[] if model_args.finetune_classifier == 1 else ["classifier"],
         task_type=TaskType.SEQ_CLS,
+        use_preconditioner=model_args.use_preconditioner,
+        preconditioner_epsilon=model_args.preconditioner_epsilon,
     )
     config.custom = {
         "mode": "lora" if head_only else model_args.mode,
